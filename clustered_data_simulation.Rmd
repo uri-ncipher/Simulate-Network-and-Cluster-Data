@@ -1,0 +1,422 @@
+---
+title: "Clustered Data Simulation Function"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Clustered Data Simulation
+
+This document illustrates how to generate clustered data and simulate potential outcomes using the `dplyr` package.
+```{r}
+
+library("dplyr")
+
+```
+
+# Build Cluster Function
+```{r}
+
+
+build_cluster <- function(K = 1000,
+                          dist = c("poisson", "nbinom", "uniform", "fixed"),
+                          lambda = 10,
+                          size = NULL,
+                          prob = NULL,
+                          min_size = 2,
+                          max_size = NULL,
+                          fixed_size = NULL,
+                          seed = NULL) {
+  if (!is.null(seed)) {
+    set.seed(seed)
+  }
+  
+  dist <- match.arg(dist)
+  
+  if (!is.numeric(K) || length(K) != 1 || K <= 0) {
+    stop("K must be a single positive number.")
+  }
+  if (!is.numeric(min_size) || length(min_size) != 1 || min_size < 1) {
+    stop("min_size must be a single number >= 1.")
+  }
+  
+  K <- as.integer(K)
+  min_size <- as.integer(min_size)
+  
+  cluster_size <- switch(
+    dist,
+    poisson = {
+      if (is.null(lambda) || lambda <= 0) stop("lambda must be > 0 for poisson.")
+      stats::rpois(K, lambda)
+    },
+    nbinom = {
+      if (is.null(size) || size <= 0) stop("size must be > 0 for nbinom.")
+      if (is.null(prob) || prob <= 0 || prob >= 1) stop("prob must be in (0, 1) for nbinom.")
+      stats::rnbinom(K, size = size, prob = prob)
+    },
+    uniform = {
+      if (is.null(max_size) || max_size < min_size) {
+        stop("max_size must be >= min_size for uniform.")
+      }
+      sample(min_size:max_size, K, replace = TRUE)
+    },
+    fixed = {
+      if (is.null(fixed_size) || fixed_size < 1) {
+        stop("fixed_size must be >= 1 for fixed.")
+      }
+      rep(as.integer(fixed_size), K)
+    }
+  )
+  
+  keep <- which(cluster_size >= min_size)
+  
+  if (length(keep) == 0) {
+    stop("No clusters satisfy the minimum size condition.")
+  }
+  
+  kept_sizes <- cluster_size[keep]
+  
+  dat.cluster <- data.frame(
+    cluster_id = rep(seq_along(keep), times = kept_sizes)
+  )
+  
+  dat.cluster$subject_id <- seq_len(nrow(dat.cluster))
+  dat.cluster$interference_set_size <- kept_sizes[dat.cluster$cluster_id] - 1
+  
+  dat.cluster <- dat.cluster[, c("subject_id", "cluster_id", "interference_set_size")]
+  
+  attr(dat.cluster, "cluster_sizes") <- kept_sizes
+  attr(dat.cluster, "dist") <- dist
+  attr(dat.cluster, "n_clusters_kept") <- length(keep)
+  attr(dat.cluster, "original_K") <- K
+  
+  return(dat.cluster)
+}
+```
+
+
+# Simulate Cluster Outcome Function
+```{r}
+
+simulate_cluster_outcome <- function(dat.cluster,
+                                     p_L = 0.4,
+                                     outcome_intercept = 0.5,
+                                     beta_a = -0.5,
+                                     beta_abar = -0.5,
+                                     beta_a_abar = 0.25,
+                                     outcome_covars = "L_i", 
+                                     outcome_coefs = 0.25,
+                                     propensity_intercept = -0.5,
+                                     treatment_covars = "L_i",
+                                     treatment_coefs = 1,
+                                     define_observed_outcome = FALSE) {
+  
+  
+  # if L_i is needed but not already in data, generate it, p_L is used for generate L_i
+  if ("L_i" %in% c(outcome_covars, treatment_covars) && !("L_i" %in% names(dat.cluster))) {
+    dat.cluster$L_i <- rbinom(nrow(dat.cluster), 1, p_L)
+  }
+  
+  data <- dat.cluster
+  n <- nrow(data)
+  
+  Ni <- data$interference_set_size
+  
+  # check lengths
+  if (length(outcome_covars) != length(outcome_coefs)) {
+    stop("length(outcome_covars) must equal length(outcome_coefs)")
+  }
+  if (length(treatment_covars) != length(treatment_coefs)) {
+    stop("length(treatment_covars) must equal length(treatment_coefs)")
+  }
+  
+  # check variable names exist
+  if (!all(outcome_covars %in% names(data))) {
+    stop("Some outcome_covars are not in dat.cluster")
+  }
+  if (!all(treatment_covars %in% names(data))) {
+    stop("Some treatment_covars are not in dat.cluster")
+  }
+  
+  PO <- vector("list", length = n)
+  
+  for (i in seq_len(n)) {
+    PO[[i]] <- matrix(NA_integer_, nrow = 2, ncol = Ni[i] + 1)
+  }
+  
+  for (i in seq_len(n)) {
+    X_outcome_i <- as.numeric(data[i, outcome_covars, drop = TRUE])
+    
+    for (j in 0:1) {
+      for (k in 0:Ni[i]) {
+        
+        abar <- if (Ni[i] == 0) 0 else k / Ni[i]
+        
+        eta <- outcome_intercept +
+          beta_a * j +
+          beta_abar * abar +
+          beta_a_abar * j * abar +
+          sum(outcome_coefs * X_outcome_i)
+        
+        p <- plogis(eta)
+        PO[[i]][j + 1, k + 1] <- rbinom(1, 1, p)
+      }
+    }
+  }
+  
+  if (!define_observed_outcome) {
+    return(PO)
+  }
+  
+  # treatment assignment
+  X_treat <- as.matrix(data[, treatment_covars, drop = FALSE])
+  pA <- plogis(propensity_intercept + X_treat %*% treatment_coefs)
+  dat.cluster$Ai <- rbinom(nrow(dat.cluster), size = 1, prob = as.numeric(pA))
+  
+  # cluster neighbor treatment exposure
+  dat.cluster <- dat.cluster %>%
+    dplyr::group_by(cluster_id) %>%
+    dplyr::mutate(
+      treated_neighbors = sum(Ai) - Ai,
+      Abar_Ni = ifelse(interference_set_size == 0,
+                       0,
+                       treated_neighbors / interference_set_size),
+      n = dplyr::n()
+    ) %>%
+    dplyr::ungroup()
+  
+  # observed outcome
+  dat.cluster$Y_obs <- vapply(
+    seq_len(nrow(dat.cluster)),
+    function(i) {
+      PO_i <- PO[[i]]
+      PO_i[
+        dat.cluster$Ai[i] + 1,
+        dat.cluster$treated_neighbors[i] + 1
+      ]
+    },
+    numeric(1)
+  )
+  
+  return(dat.cluster)
+}
+
+```
+
+
+# True Casual Effect Generation
+```{r}
+
+
+simulate_cluster_true_effect <- function(PO,
+                                         dat.cluster,
+                                         allocations = c(0.25, 0.5, 0.75)) {
+  
+  req_cols <- c("subject_id", "cluster_id", "interference_set_size")
+  if (!all(req_cols %in% names(dat.cluster))) {
+    stop("dat.cluster must contain 'subject_id', 'cluster_id', and 'interference_set_size'.")
+  }
+  
+  if (!is.list(PO)) {
+    stop("PO must be a list of potential outcome matrices.")
+  }
+  
+  if (length(PO) != nrow(dat.cluster)) {
+    stop("length(PO) must equal nrow(dat.cluster).")
+  }
+  
+  if (length(allocations) < 1) {
+    stop("allocations must contain at least one value.")
+  }
+  
+  if (any(allocations < 0 | allocations > 1)) {
+    stop("allocations must be between 0 and 1.")
+  }
+  
+  y_bar_ind <- function(PO, i, a, alpha) {
+    M <- PO[[i]]
+    n_nei <- ncol(M) - 1
+    Arow <- a + 1
+    
+    out <- 0
+    for (k in 0:n_nei) {
+      out <- out + M[Arow, k + 1] * stats::dbinom(k, size = n_nei, prob = alpha)
+    }
+    out
+  }
+  
+  y_bar <- function(PO, dat.cluster, a, alpha) {
+    cl_ids <- unique(dat.cluster$cluster_id)
+    out <- 0
+    
+    for (cl in cl_ids) {
+      idx <- which(dat.cluster$cluster_id == cl)
+      cl_mean <- mean(vapply(idx, function(i) y_bar_ind(PO, i, a, alpha), numeric(1)))
+      out <- out + cl_mean
+    }
+    
+    out / length(cl_ids)
+  }
+  
+  y_bar_ind_margin <- function(PO, i, alpha) {
+    M <- PO[[i]]
+    n_nei <- ncol(M) - 1
+    
+    out <- 0
+    for (a in 0:1) {
+      pa <- if (a == 1) alpha else (1 - alpha)
+      for (k in 0:n_nei) {
+        out <- out + M[a + 1, k + 1] *
+          pa *
+          stats::dbinom(k, size = n_nei, prob = alpha)
+      }
+    }
+    out
+  }
+  
+  y_bar_margin <- function(PO, dat.cluster, alpha) {
+    cl_ids <- unique(dat.cluster$cluster_id)
+    out <- 0
+    
+    for (cl in cl_ids) {
+      idx <- which(dat.cluster$cluster_id == cl)
+      cl_mean <- mean(vapply(idx, function(i) y_bar_ind_margin(PO, i, alpha), numeric(1)))
+      out <- out + cl_mean
+    }
+    
+    out / length(cl_ids)
+  }
+  
+  DE_true <- function(alpha) {
+    y_bar(PO, dat.cluster, a = 1, alpha = alpha) -
+      y_bar(PO, dat.cluster, a = 0, alpha = alpha)
+  }
+  
+  IE_true <- function(alpha1, alpha0) {
+    y_bar(PO, dat.cluster, a = 0, alpha = alpha1) -
+      y_bar(PO, dat.cluster, a = 0, alpha = alpha0)
+  }
+  
+  TE_true <- function(alpha1, alpha0) {
+    y_bar(PO, dat.cluster, a = 1, alpha = alpha1) -
+      y_bar(PO, dat.cluster, a = 0, alpha = alpha0)
+  }
+  
+  OE_true <- function(alpha1, alpha0) {
+    y_bar_margin(PO, dat.cluster, alpha = alpha1) -
+      y_bar_margin(PO, dat.cluster, alpha = alpha0)
+  }
+  
+  # direct effects at each allocation
+  de_df <- data.frame(
+    effect = "DE",
+    alpha = allocations,
+    estimate = vapply(allocations, DE_true, numeric(1))
+  )
+  
+  # pairwise effects between allocations
+  pair_mat <- utils::combn(allocations, 2)
+  
+  ie_df <- data.frame(
+    effect = "IE",
+    alpha1 = pair_mat[1, ],
+    alpha0 = pair_mat[2, ],
+    estimate = vapply(seq_len(ncol(pair_mat)), function(j) {
+      IE_true(pair_mat[1, j], pair_mat[2, j])
+    }, numeric(1))
+  )
+  
+  te_df <- data.frame(
+    effect = "TE",
+    alpha1 = pair_mat[1, ],
+    alpha0 = pair_mat[2, ],
+    estimate = vapply(seq_len(ncol(pair_mat)), function(j) {
+      TE_true(pair_mat[1, j], pair_mat[2, j])
+    }, numeric(1))
+  )
+  
+  oe_df <- data.frame(
+    effect = "OE",
+    alpha1 = pair_mat[1, ],
+    alpha0 = pair_mat[2, ],
+    estimate = vapply(seq_len(ncol(pair_mat)), function(j) {
+      OE_true(pair_mat[1, j], pair_mat[2, j])
+    }, numeric(1))
+  )
+  
+  out <- list(
+    allocations = allocations,
+    DE = de_df,
+    IE = ie_df,
+    TE = te_df,
+    OE = oe_df
+  )
+  
+  class(out) <- "cluster_true_effect"
+  out
+}
+
+
+
+```
+
+
+
+
+# Testing for adding covariates in the outcome and treatment model
+```{r}
+
+dat.cluster = build_cluster(K = 1000, lambda =  10)
+
+
+dat.cluster
+
+
+dat.cluster$X2 <- rbinom(nrow(dat.cluster), 1, 0.5)
+dat.cluster$X3 <- runif(nrow(dat.cluster))
+dat.cluster$X1 <- rbinom(nrow(dat.cluster), 1, 0.5)
+dat.cluster$Li <- runif(nrow(dat.cluster))
+
+
+# Li is default in the equation,which is needed, x1,x2,x3 are the added_covariates.
+
+sim_out <- simulate_cluster_outcome(
+  dat.cluster,
+  outcome_covars = c("L_i", "X1", "X2", "X3"),
+  outcome_coefs = c(0.25, 0.6, -0.4, 0.2),
+  treatment_covars = c("L_i", "X2"),
+  treatment_coefs = c(1, 0.8),
+  define_observed_outcome = FALSE
+)
+
+
+
+# If want to to see the outcome and treatment model 
+out <- simulate_cluster_outcome(
+  dat.cluster,
+  define_observed_outcome = TRUE
+)
+
+
+
+
+
+```
+
+
+# Testing for the true casusal effect
+```{r}
+
+sim_out <- simulate_cluster_outcome(dat.cluster, define_observed_outcome = FALSE)
+
+true_eff <- simulate_cluster_true_effect(
+  PO = sim_out,
+  dat.cluster = dat.cluster,
+  allocations = c(0.25, 0.5, 0.75)
+)
+
+
+true_eff
+
+```
+

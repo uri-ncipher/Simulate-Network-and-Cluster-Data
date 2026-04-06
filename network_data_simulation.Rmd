@@ -1,0 +1,388 @@
+---
+title: "Network Data Simulation"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Network Data Simulation
+```{r}
+library(dplyr)
+library(igraph)
+
+```
+
+# Build network data function
+```{r}
+
+build_network <- function(x1, x2) {
+  
+  edges <- data.frame(
+    EGO_ID   = as.character(x1),
+    ALTER_ID = as.character(x2)
+  )
+  
+  nodes <- data.frame(
+    name = unique(c(edges$EGO_ID, edges$ALTER_ID))
+  )
+  
+  net0 <- igraph::graph_from_data_frame(
+    d = edges,
+    vertices = nodes,
+    directed = FALSE
+  )
+  
+  net0 <- igraph::delete_vertices(net0, which(igraph::degree(net0) == 0))
+  net0 <- igraph::simplify(net0, remove.multiple = TRUE, remove.loops = TRUE)
+  
+  n <- igraph::vcount(net0)
+  
+  data <- data.frame(
+    subject_id = as.integer(igraph::V(net0)$name),
+    id = seq_len(n)
+  )
+  
+  data$na <- igraph::degree(net0)
+  
+  return(list(
+    net0 = net0,
+    n = n,
+    data = data
+  ))
+}
+
+
+```
+
+
+# Simulate Network Outcome Function
+```{r}
+
+simulate_network_outcome <- function(net_obj,
+                                     p_L = 0.4,
+                                     outcome_intercept = 0.5,
+                                     beta_a = -0.5,
+                                     beta_abar = -0.5,
+                                     beta_a_abar = 0.25,
+                                     outcome_covars = "L_i",
+                                     outcome_coefs = 0.25,
+                                     propensity_intercept = -0.5,
+                                     treatment_covars = "L_i",
+                                     treatment_coefs = 1,
+                                     define_observed_outcome = FALSE) {
+  
+  net0 <- net_obj$net0
+  dat.network <- net_obj$data
+  
+  # rename
+  dat.network$interference_set_size <- dat.network$na
+  
+  # if L_i is needed but not already in data, generate it
+  if ("L_i" %in% c(outcome_covars, treatment_covars) && !("L_i" %in% names(dat.network))) {
+    dat.network$L_i <- rbinom(nrow(dat.network), 1, p_L)
+  }
+  
+  data <- dat.network
+  n <- nrow(data)
+  
+  Ni <- data$interference_set_size
+  
+  # check lengths
+  if (length(outcome_covars) != length(outcome_coefs)) {
+    stop("length(outcome_covars) must equal length(outcome_coefs)")
+  }
+  if (length(treatment_covars) != length(treatment_coefs)) {
+    stop("length(treatment_covars) must equal length(treatment_coefs)")
+  }
+  
+  # check variable names exist
+  if (!all(outcome_covars %in% names(data))) {
+    stop("Some outcome_covars are not in dat.network")
+  }
+  if (!all(treatment_covars %in% names(data))) {
+    stop("Some treatment_covars are not in dat.network")
+  }
+  
+  PO <- vector("list", length = n)
+  
+  for (i in seq_len(n)) {
+    PO[[i]] <- matrix(NA_integer_, nrow = 2, ncol = Ni[i] + 1)
+  }
+  
+  for (i in seq_len(n)) {
+    X_outcome_i <- as.numeric(data[i, outcome_covars, drop = TRUE])
+    
+    for (j in 0:1) {
+      for (k in 0:Ni[i]) {
+        
+        abar <- if (Ni[i] == 0) 0 else k / Ni[i]
+        
+        eta <- outcome_intercept +
+          beta_a * j +
+          beta_abar * abar +
+          beta_a_abar * j * abar +
+          sum(outcome_coefs * X_outcome_i)
+        
+        p <- plogis(eta)
+        
+        PO[[i]][j + 1, k + 1] <- rbinom(1, 1, p)
+      }
+    }
+  }
+  
+  if (!define_observed_outcome) {
+    return(PO)
+  }
+  
+  # treatment assignment
+  X_treat <- as.matrix(data[, treatment_covars, drop = FALSE])
+  pA <- plogis(propensity_intercept + X_treat %*% treatment_coefs)
+  dat.network$Ai <- rbinom(nrow(dat.network), size = 1, prob = as.numeric(pA))
+  
+  # neighbor treatment exposure
+  dat.network$treated_neighbors <- vapply(
+    seq_len(nrow(dat.network)),
+    function(i) {
+      nbrs <- igraph::neighbors(net0, i)
+      sum(dat.network$Ai[as.integer(nbrs)])
+    },
+    numeric(1)
+  )
+  
+  dat.network$Abar_Ni <- ifelse(
+    dat.network$interference_set_size == 0,
+    0,
+    dat.network$treated_neighbors / dat.network$interference_set_size
+  )
+  
+  # observed outcome
+  dat.network$Y_obs <- vapply(
+    seq_len(nrow(dat.network)),
+    function(i) {
+      PO_i <- PO[[i]]
+      PO_i[
+        dat.network$Ai[i] + 1,
+        dat.network$treated_neighbors[i] + 1
+      ]
+    },
+    numeric(1)
+  )
+  
+  dat.network$na <- NULL
+  
+  return(dat.network)
+}
+
+```
+
+# simulate newtork true casusal effect
+```{r}
+
+simulate_network_true_effect <- function(PO,
+                                         dat.network,
+                                         allocations = c(0.25, 0.5, 0.75)) {
+  
+  req_cols <- c("subject_id", "interference_set_size")
+  if (!all(req_cols %in% names(dat.network))) {
+    stop("dat.network must contain 'subject_id' and 'interference_set_size'.")
+  }
+  
+  if (!is.list(PO)) {
+    stop("PO must be a list of potential outcome matrices.")
+  }
+  
+  if (length(PO) != nrow(dat.network)) {
+    stop("length(PO) must equal nrow(dat.network).")
+  }
+  
+  if (length(allocations) < 1) {
+    stop("allocations must contain at least one value.")
+  }
+  
+  if (any(allocations < 0 | allocations > 1)) {
+    stop("allocations must be between 0 and 1.")
+  }
+  
+  # assume PO[[i]] corresponds to row i in dat.network
+  # each PO[[i]] is a 2 x (Ni + 1) matrix:
+  # row 1 = a = 0, row 2 = a = 1
+  # column k+1 = k treated neighbors
+  
+  y_bar_ind <- function(PO, i, a, alpha) {
+    M <- PO[[i]]
+    n_nei <- ncol(M) - 1
+    Arow <- a + 1
+    
+    out <- 0
+    for (k in 0:n_nei) {
+      out <- out + M[Arow, k + 1] * stats::dbinom(k, size = n_nei, prob = alpha)
+    }
+    out
+  }
+  
+  y_bar <- function(PO, dat.network, a, alpha) {
+    mean(vapply(
+      seq_len(nrow(dat.network)),
+      function(i) y_bar_ind(PO, i, a, alpha),
+      numeric(1)
+    ))
+  }
+  
+  y_bar_ind_margin <- function(PO, i, alpha) {
+    M <- PO[[i]]
+    n_nei <- ncol(M) - 1
+    
+    out <- 0
+    for (a in 0:1) {
+      pa <- if (a == 1) alpha else (1 - alpha)
+      for (k in 0:n_nei) {
+        out <- out + M[a + 1, k + 1] *
+          pa *
+          stats::dbinom(k, size = n_nei, prob = alpha)
+      }
+    }
+    out
+  }
+  
+  y_bar_margin <- function(PO, dat.network, alpha) {
+    mean(vapply(
+      seq_len(nrow(dat.network)),
+      function(i) y_bar_ind_margin(PO, i, alpha),
+      numeric(1)
+    ))
+  }
+  
+  DE_true <- function(alpha) {
+    y_bar(PO, dat.network, a = 1, alpha = alpha) -
+      y_bar(PO, dat.network, a = 0, alpha = alpha)
+  }
+  
+  IE_true <- function(alpha1, alpha0) {
+    y_bar(PO, dat.network, a = 0, alpha = alpha1) -
+      y_bar(PO, dat.network, a = 0, alpha = alpha0)
+  }
+  
+  TE_true <- function(alpha1, alpha0) {
+    y_bar(PO, dat.network, a = 1, alpha = alpha1) -
+      y_bar(PO, dat.network, a = 0, alpha = alpha0)
+  }
+  
+  OE_true <- function(alpha1, alpha0) {
+    y_bar_margin(PO, dat.network, alpha = alpha1) -
+      y_bar_margin(PO, dat.network, alpha = alpha0)
+  }
+  
+  # direct effects at each allocation
+  de_df <- data.frame(
+    effect = "DE",
+    alpha = allocations,
+    estimate = vapply(allocations, DE_true, numeric(1))
+  )
+  
+  # pairwise effects between allocations
+  pair_mat <- utils::combn(allocations, 2)
+  
+  ie_df <- data.frame(
+    effect = "IE",
+    alpha1 = pair_mat[1, ],
+    alpha0 = pair_mat[2, ],
+    estimate = vapply(seq_len(ncol(pair_mat)), function(j) {
+      IE_true(pair_mat[1, j], pair_mat[2, j])
+    }, numeric(1))
+  )
+  
+  te_df <- data.frame(
+    effect = "TE",
+    alpha1 = pair_mat[1, ],
+    alpha0 = pair_mat[2, ],
+    estimate = vapply(seq_len(ncol(pair_mat)), function(j) {
+      TE_true(pair_mat[1, j], pair_mat[2, j])
+    }, numeric(1))
+  )
+  
+  oe_df <- data.frame(
+    effect = "OE",
+    alpha1 = pair_mat[1, ],
+    alpha0 = pair_mat[2, ],
+    estimate = vapply(seq_len(ncol(pair_mat)), function(j) {
+      OE_true(pair_mat[1, j], pair_mat[2, j])
+    }, numeric(1))
+  )
+  
+  out <- list(
+    allocations = allocations,
+    DE = de_df,
+    IE = ie_df,
+    TE = te_df,
+    OE = oe_df
+  )
+  
+  class(out) <- "network_true_effect"
+  out
+}
+
+```
+
+
+# Testing function
+```{r}
+
+
+set.seed(1)
+
+# -------------------------
+# 1. Build small network
+# -------------------------
+x1 <- c(1,1,2,2,3,4,5,6)
+x2 <- c(2,3,3,4,4,5,6,1)
+
+net_obj <- build_network(x1, x2)
+
+# add covariate (IMPORTANT)
+net_obj$data$L_i <- rbinom(nrow(net_obj$data), 1, 0.4)
+
+# -------------------------
+# 2. Generate PO
+# -------------------------
+PO_net <- simulate_network_outcome(
+  net_obj,
+  define_observed_outcome = FALSE
+)
+
+cat("PO length:", length(PO_net), "\n")
+cat("First PO dim:", dim(PO_net[[1]]), "\n")
+
+# -------------------------
+# 3. Generate observed data
+# -------------------------
+obs_net <- simulate_network_outcome(
+  net_obj,
+  define_observed_outcome = TRUE
+)
+
+print(head(obs_net))
+
+# -------------------------
+# 4. Prepare data for true effect
+# -------------------------
+dat.network <- net_obj$data
+dat.network$interference_set_size <- dat.network$na
+
+# -------------------------
+# 5. Compute true causal effect
+# -------------------------
+true_net <- simulate_network_true_effect(
+  PO = PO_net,
+  dat.network = dat.network
+)
+
+# -------------------------
+# 6. Print results
+# -------------------------
+print(true_net$DE)
+print(true_net$IE)
+print(true_net$TE)
+print(true_net$OE)
+
+```
+
