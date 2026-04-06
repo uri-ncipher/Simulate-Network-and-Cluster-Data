@@ -16,9 +16,9 @@ The package includes functions for:
 - generating observed treatment and outcome data
 - computing true causal effects, including direct, indirect, total, and overall effects
 
-For clustered settings, the package includes functions to build cluster data, simulate cluster outcomes, and compute true causal effects from cluster-level potential outcomes. :contentReference[oaicite:2]{index=2} :contentReference[oaicite:3]{index=3} :contentReference[oaicite:4]{index=4}
+For clustered settings, the package includes functions to build cluster data, simulate cluster outcomes, and compute true causal effects from cluster-level potential outcomes.
 
-For network settings, the package includes functions to build a network from edge data, simulate network outcomes, and compute true causal effects from network potential outcomes. :contentReference[oaicite:5]{index=5} :contentReference[oaicite:6]{index=6} :contentReference[oaicite:7]{index=7}
+For network settings, the package includes functions to build a network from edge data, simulate network outcomes, and compute true causal effects from network potential outcomes. 
 
 ## Installation
 
